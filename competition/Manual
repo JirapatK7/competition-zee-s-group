@@ -1,1 +1,323 @@
+# =====================================================================
+#  MANUAL ROBOT CONTROLLER - RAI Computer Programming Competition 2026
+#  CyberPi + mBot2 shield + Makeblock Gamepad      (mBlock 5, PYTHON mode, upload)
+#
+#  HOW TO USE
+#   1. mBlock -> Devices -> CyberPi -> switch to PYTHON (not blocks), mode "Upload".
+#   2. Paste this whole file, connect the CyberPi with USB-C, press Upload.
+#   3. Switch the gamepad on (it pairs by Bluetooth with the CyberPi).
+#   4. Robot starts LOCKED. After the referee's start call press START.
+#
+#  GAMEPAD MAP
+#   Left stick ........ drive (up/down = forward/back, left/right = turn)
+#   R1 (hold) ......... SLOW / precise driving
+#   D-pad Up / Down ... lift mast UP / DOWN (hold)
+#   D-pad Left / Right  tilt shooter nose DOWN / UP (hold)
+#   N1 ................ gripper OPEN
+#   N2 ................ gripper close on YELLOW ball (70 mm)
+#   N3 ................ gripper close on GREEN ball (100 mm)
+#   L1 ................ COCK the shooter (automatic: winch pulls, latch holds, rope goes slack)
+#   N4 ................ FIRE (opens gripper, then releases the latch) - only when cocked
+#   R2 (hold) ......... winch jog: pull sled back      (only when NOT cocked)
+#   L2 (hold) ......... winch jog: let rope out         (only when NOT cocked)
+#   START ............. unlock (GO)
+#   SELECT ............ LOCK / EMERGENCY STOP (stops every motor; also aborts cocking)
+#
+#  FIRST-TIME SETUP: everything marked CALIBRATE must be tuned on the real robot.
+#  Change numbers ONLY in the SETTINGS block. If something moves the wrong way,
+#  flip the matching *_SIGN / *_DIR value (1 <-> -1).
+# =====================================================================
+import cyberpi
+import mbot2
+import gamepad
+import time
 
+# ------------------------------ SETTINGS ------------------------------
+# ---- ports (CHECK against your wiring) ----
+WINCH = "M1"          # yellow TT motor (cocking winch)  on shield DC port M1
+LIFT = "M2"           # extra DC motor (lift winch)      on shield DC port M2
+GRIP = "s1"           # servo: gripper
+LATCH = "s2"          # servo: latch lever
+TILT = "s3"           # servo: tilt (pinion 15T -> sector 30T)
+
+# ---- driving ----
+MAX_POWER = 100       # 0..100 top drive power
+SLOW_FACTOR = 0.4     # R1 held: drive at 40 %
+DEADZONE = 8          # stick values below this are ignored (0..100)
+EXPO = 0.4            # 0 = linear stick, 1 = very soft near the centre
+FWD_SIGN = 1          # -1 if the robot drives backwards when you push forward
+TURN_SIGN = 1         # -1 if it turns left when you push right
+LEFT_SIGN = 1         # mBot2 convention: forward = left +p, right -p
+RIGHT_SIGN = -1       # set both to 1 / -1 differently only if a wheel runs backwards
+
+# ---- lift ----
+LIFT_DIR = 1          # -1 if D-pad Up lowers the mast
+LIFT_UP_POWER = 100
+LIFT_DOWN_POWER = 50  # gravity helps going down; gentler = rope stays tight
+LIFT_HOLD_POWER = 0   # CALIBRATE: small power (0..30) if the mast sinks when you let go
+LIFT_LIMITS_ON = False        # True = software limits from time (needs calibration below)
+LIFT_TRAVEL_SECONDS = 2.5     # CALIBRATE: seconds at full power from bottom to top
+
+# ---- tilt (servo degrees; servo turns 2x the cradle angle: 15T -> 30T) ----
+TILT_LEVEL = 90       # CALIBRATE: servo angle where the shooter is level
+TILT_MIN = 40         # CALIBRATE: lowest servo angle allowed
+TILT_MAX = 140        # CALIBRATE: highest servo angle allowed
+TILT_DIR = 1          # -1 if D-pad Right tilts the nose down
+TILT_SPEED = 40       # servo degrees per second while the D-pad is held
+
+# ---- gripper (servo degrees; the servo drives the gear directly) ----
+GRIP_OPEN = 113       # CALIBRATE: fingers fully open (stop at 172 deg crank)
+GRIP_YELLOW = 60      # CALIBRATE: closed on the 70 mm ball
+GRIP_GREEN = 84       # CALIBRATE: closed on the 100 mm ball (about 24 deg more than yellow)
+
+# ---- shooter ----
+WINCH_DIR = 1         # -1 if "cock" makes the winch let rope OUT instead of pulling
+WINCH_POWER = 100     # power while cocking
+WINCH_JOG_POWER = 60  # power for the R2 / L2 manual jog
+COCK_TIME = 3.0       # CALIBRATE: seconds of pulling until the sled is behind the latch (README: ~3 s)
+SLACK_TIME = 1.0      # CALIBRATE: seconds of reverse after latching (>= 90 mm rope = 2.9 spool turns)
+LATCH_HOLD = 30       # CALIBRATE: latch servo angle that holds the sled
+LATCH_RELEASE = 100   # CALIBRATE: latch servo angle that lets the sled go
+LATCH_SETTLE = 0.25   # seconds to wait for the latch to move
+FIRE_DELAY = 0.15     # seconds between opening the gripper and releasing the latch
+START_COCKED = True   # True = assume the sled is already cocked at power-on (inspection posture).
+                      # Safe default: L1 would release the latch first, which would FIRE a cocked sled.
+                      # If it is NOT cocked: press N4 once, then L1.
+
+# ---- program ----
+LOOP_DT = 0.02        # 50 loops per second
+STATUS_EVERY = 12     # refresh the CyberPi screen every 12 loops
+# ----------------------------------------------------------------------
+
+locked = True
+armed = START_COCKED
+homed = False
+tilt = TILT_LEVEL
+lift_pos = 0.0        # estimated 0..1 (open loop, only used when LIFT_LIMITS_ON)
+last_text = ""
+prev_keys = {}
+
+
+def clamp(v, lo, hi):
+    if v < lo:
+        return lo
+    if v > hi:
+        return hi
+    return v
+
+
+def shape(v):
+    # dead-zone plus a soft curve; v is -100..100, result -100..100
+    if abs(v) < DEADZONE:
+        return 0
+    sign = 1
+    if v < 0:
+        sign = -1
+    a = (abs(v) - DEADZONE) / (100.0 - DEADZONE)
+    a = clamp(a, 0, 1)
+    a = (1 - EXPO) * a + EXPO * a * a
+    return sign * a * 100
+
+
+def just_pressed(key):
+    # True only on the loop where the button goes from released to pressed
+    now = gamepad.is_key_pressed(key)
+    was = prev_keys.get(key, False)
+    prev_keys[key] = now
+    return now and not was
+
+
+def servo(port, angle):
+    mbot2.servo_set(int(clamp(angle, 0, 180)), port)
+
+
+def motor(port, power):
+    mbot2.motor_set(int(clamp(power, -100, 100)), port)
+
+
+def drive(left, right):
+    mbot2.drive_power(int(left * LEFT_SIGN), int(right * RIGHT_SIGN))
+
+
+def stop_all():
+    drive(0, 0)
+    motor(WINCH, 0)
+    motor(LIFT, 0)
+
+
+def show_status(force):
+    global last_text
+    if locked:
+        line1 = "LOCKED - press START"
+    else:
+        line1 = "GO"
+    if armed:
+        line2 = "COCKED (N4 = fire)"
+    else:
+        line2 = "not cocked (L1)"
+    text = line1 + "|" + line2 + "|tilt " + str(int(tilt)) + "|lift " + str(int(lift_pos * 100)) + "%"
+    if text == last_text and not force:
+        return
+    last_text = text
+    try:
+        cyberpi.console.clear()
+        cyberpi.console.println(line1)
+        cyberpi.console.println(line2)
+        cyberpi.console.println("tilt " + str(int(tilt)))
+        cyberpi.console.println("lift " + str(int(lift_pos * 100)) + "%")
+    except:
+        pass   # the screen must never stop the robot
+
+
+def wait_or_abort(seconds):
+    # waits, but SELECT aborts. Returns False if aborted.
+    steps = int(seconds / LOOP_DT)
+    for i in range(steps):
+        if gamepad.is_key_pressed("Select"):
+            return False
+        time.sleep(LOOP_DT)
+    return True
+
+
+def do_cock():
+    # release latch -> pull sled back -> latch holds -> rope slack -> armed
+    global armed, locked
+    servo(LATCH, LATCH_RELEASE)
+    time.sleep(LATCH_SETTLE)
+    motor(WINCH, WINCH_POWER * WINCH_DIR)
+    ok = wait_or_abort(COCK_TIME)
+    motor(WINCH, 0)
+    if not ok:
+        locked = True
+        armed = False
+        return
+    servo(LATCH, LATCH_HOLD)
+    time.sleep(LATCH_SETTLE)
+    motor(WINCH, -WINCH_POWER * WINCH_DIR)
+    ok = wait_or_abort(SLACK_TIME)
+    motor(WINCH, 0)
+    if ok:
+        armed = True
+    else:
+        locked = True
+        armed = True   # latch was already closed, the sled is held
+
+
+def do_fire():
+    # open the gripper first, then let the sled go
+    global armed
+    servo(GRIP, GRIP_OPEN)
+    time.sleep(FIRE_DELAY)
+    servo(LATCH, LATCH_RELEASE)
+    time.sleep(LATCH_SETTLE)
+    armed = False
+
+
+def go_home():
+    # first START only: put tilt level and open the gripper
+    global homed, tilt
+    servo(TILT, TILT_LEVEL)
+    servo(GRIP, GRIP_OPEN)
+    tilt = TILT_LEVEL
+    homed = True
+
+
+def update_drive():
+    fwd = shape(gamepad.get_joystick("Ly")) * FWD_SIGN
+    turn = shape(gamepad.get_joystick("Lx")) * TURN_SIGN
+    left = fwd + turn
+    right = fwd - turn
+    biggest = max(abs(left), abs(right))
+    if biggest > 100:
+        left = left * 100.0 / biggest
+        right = right * 100.0 / biggest
+    scale = MAX_POWER / 100.0
+    if gamepad.is_key_pressed("R1"):
+        scale = scale * SLOW_FACTOR
+    drive(left * scale, right * scale)
+
+
+def update_lift():
+    global lift_pos
+    power = 0
+    if gamepad.is_key_pressed("Up"):
+        if (not LIFT_LIMITS_ON) or lift_pos < 1.0:
+            power = LIFT_UP_POWER
+            lift_pos = clamp(lift_pos + LOOP_DT / LIFT_TRAVEL_SECONDS, 0, 1)
+    elif gamepad.is_key_pressed("Down"):
+        if (not LIFT_LIMITS_ON) or lift_pos > 0.0:
+            power = -LIFT_DOWN_POWER
+            lift_pos = clamp(lift_pos - LOOP_DT / LIFT_TRAVEL_SECONDS * (LIFT_DOWN_POWER / 100.0), 0, 1)
+    else:
+        power = LIFT_HOLD_POWER
+    motor(LIFT, power * LIFT_DIR)
+
+
+def update_tilt():
+    global tilt
+    step = TILT_SPEED * LOOP_DT
+    changed = False
+    if gamepad.is_key_pressed("Right"):
+        tilt = tilt + step * TILT_DIR
+        changed = True
+    elif gamepad.is_key_pressed("Left"):
+        tilt = tilt - step * TILT_DIR
+        changed = True
+    if changed:
+        tilt = clamp(tilt, TILT_MIN, TILT_MAX)
+        servo(TILT, tilt)
+
+
+def update_gripper():
+    if just_pressed("N1"):
+        servo(GRIP, GRIP_OPEN)
+    if just_pressed("N2"):
+        servo(GRIP, GRIP_YELLOW)
+    if just_pressed("N3"):
+        servo(GRIP, GRIP_GREEN)
+
+
+def update_shooter():
+    if just_pressed("N4"):
+        if armed:
+            do_fire()
+        return
+    if just_pressed("L1"):
+        if not armed:
+            do_cock()
+        return
+    # manual winch jog: only when not cocked (never fight the latch)
+    if (not armed) and gamepad.is_key_pressed("R2"):
+        motor(WINCH, WINCH_JOG_POWER * WINCH_DIR)
+    elif (not armed) and gamepad.is_key_pressed("L2"):
+        motor(WINCH, -WINCH_JOG_POWER * WINCH_DIR)
+    else:
+        motor(WINCH, 0)
+
+
+# ------------------------------ MAIN LOOP ------------------------------
+show_status(True)
+count = 0
+while True:
+    if just_pressed("Select"):
+        locked = True
+        stop_all()
+    if just_pressed("Start"):
+        locked = False
+        if not homed:
+            go_home()
+
+    if locked:
+        stop_all()
+    else:
+        update_drive()
+        update_lift()
+        update_tilt()
+        update_gripper()
+        update_shooter()
+
+    count = count + 1
+    if count >= STATUS_EVERY:
+        count = 0
+        show_status(False)
+    time.sleep(LOOP_DT)
